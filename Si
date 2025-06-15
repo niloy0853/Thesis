@@ -1,0 +1,1038 @@
+# ISFET Priority 1 Analysis - Complete Fixed Version with Max gm Method
+# Optimized for accurate Vth extraction and current sensitivity using max transconductance
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.optimize import curve_fit
+from sklearn.metrics import r2_score
+import warnings
+warnings.filterwarnings('ignore')
+
+filename ='/kaggle/input/si-all-temp/Si_Al2O3_Id_vs_Vg_all_temp.xlsx'
+
+# Set style for publication-quality plots
+plt.style.use('default')
+sns.set_palette("husl")
+
+class ISFETAnalyzer:
+    def __init__(self, filename):
+        """Initialize ISFET analyzer focused on highest linearity"""
+        self.filename = filename
+        self.temperatures = [293, 295, 297, 299, 301, 303]  # K
+        
+        # Expected Vth range for GaAs
+        self.expected_vth_range = (0.6, 1.1)
+        print(f"Analyzing GaAs ISFET")
+        print(f"Expected Vth range: {self.expected_vth_range[0]:.1f}V to {self.expected_vth_range[1]:.1f}V")
+        print(f"Focus: HIGHEST LINEAR REGION for sqrt(Id) vs Vga extrapolation")
+        
+    def load_data(self):
+        """Load and organize data based on exact structure provided"""
+        try:
+            self.data = pd.read_excel(self.filename)
+        except:
+            self.data = pd.read_csv(self.filename.replace('.xlsx', '.csv'))
+        
+        print(f"Data shape: {self.data.shape}")
+        print(f"Columns: {self.data.columns.tolist()}")
+        
+        # Based on provided structure:
+        # A2 to A32 = pH 3, A33 to A63 = pH 5, A64 to A94 = pH 7, A95 to A125 = pH 9, A126 to A156 = pH 11
+        # Column 2 = Vga, Columns 3-8 = Id at different temperatures
+        
+        # Clean column names
+        cols = self.data.columns.tolist()
+        if len(cols) >= 8:
+            self.ph_col = cols[0]
+            self.vga_col = cols[1] 
+            self.temp_cols = cols[2:8]  # Should be Id_293K through Id_303K
+        else:
+            raise ValueError("Insufficient columns in data")
+        
+        print(f"Using columns: pH={self.ph_col}, Vga={self.vga_col}")
+        print(f"Temperature columns: {self.temp_cols}")
+        
+        # Organize data by pH with exact row ranges
+        self.pH_data = {}
+        pH_ranges = {
+            3: (1, 31),   # A2 to A32 (0-indexed: 1 to 31)
+            5: (32, 62),  # A33 to A63 (0-indexed: 32 to 62) 
+            7: (63, 93),  # A64 to A94 (0-indexed: 63 to 93)
+            9: (94, 124), # A95 to A125 (0-indexed: 94 to 124)
+            11: (125, 155) # A126 to A156 (0-indexed: 125 to 155)
+        }
+        
+        for pH, (start_idx, end_idx) in pH_ranges.items():
+            if end_idx <= len(self.data):
+                pH_df = self.data.iloc[start_idx:end_idx+1].copy()
+                
+                # Clean data for this pH
+                pH_df = pH_df.dropna()
+                
+                if len(pH_df) > 0:
+                    self.pH_data[pH] = pH_df.reset_index(drop=True)
+                    print(f"pH {pH}: {len(self.pH_data[pH])} data points")
+                    
+                    # Show Vga range for verification
+                    vga_vals = pH_df[self.vga_col].values
+                    print(f"  Vga range: {vga_vals.min():.2f}V to {vga_vals.max():.2f}V")
+        
+        return self.data
+    
+    def find_highest_linear_region(self, vga, sqrt_id, min_r2=0.98):
+        """
+        Find the region with HIGHEST linearity for sqrt(Id) vs Vga
+        More efficient and realistic for real data
+        """
+        n_points = len(vga)
+        if n_points < 6:
+            return None
+        
+        best_fit = None
+        best_r2 = 0
+        
+        # More efficient search strategy
+        min_window = 6
+        max_window = min(20, int(0.8 * n_points))
+        
+        # Debug info for problematic cases
+        debug_mode = False
+        if best_r2 == 0:  # No good fits found yet
+            debug_mode = True
+        
+        for window_size in range(max_window, min_window-1, -1):  # Start with largest windows
+            for start_idx in range(n_points - window_size + 1):
+                end_idx = start_idx + window_size
+                
+                # Extract window data
+                vga_window = vga[start_idx:end_idx]
+                sqrt_id_window = sqrt_id[start_idx:end_idx]
+                
+                # Requirements for valid fitting region
+                voltage_span = vga_window.max() - vga_window.min()
+                if voltage_span < 0.15:  # Reduced from 0.2V for better tolerance
+                    continue
+                
+                # Must have reasonable current variation - more tolerant
+                if sqrt_id_window.std() < 1e-8:  # More tolerant than 1e-7
+                    continue
+                
+                # More flexible voltage range - don't skip very low voltage regions for pH 3
+                # Allow regions starting from lower voltages
+                if vga_window.max() < 0.8:  # Reduced from 1.0V
+                    continue
+                
+                try:
+                    # Linear regression
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(vga_window, sqrt_id_window)
+                    r2 = r_value**2
+                    
+                    # Calculate potential Vth
+                    if abs(slope) > 1e-15 and slope > 0:  # Must have positive slope, more tolerant
+                        potential_vth = -intercept / slope
+                        
+                        # More flexible Vth range for pH 3 issues
+                        extended_vth_range = (self.expected_vth_range[0] - 0.2, self.expected_vth_range[1] + 0.2)
+                        
+                        # Check if Vth is within extended range and has good linearity
+                        if (extended_vth_range[0] <= potential_vth <= extended_vth_range[1] and 
+                            r2 > best_r2 and r2 > min_r2):
+                            
+                            best_r2 = r2
+                            best_fit = {
+                                'slope': slope,
+                                'intercept': intercept,
+                                'r2': r2,
+                                'vth': potential_vth,
+                                'p_value': p_value,
+                                'std_err': std_err,
+                                'vga_range': (vga_window.min(), vga_window.max()),
+                                'n_points': window_size,
+                                'start_idx': start_idx,
+                                'end_idx': end_idx,
+                                'voltage_span': voltage_span
+                            }
+                            
+                except Exception as e:
+                    if debug_mode:
+                        print(f"Regression failed: {e}")
+                    continue
+        
+        # If no good fit found with high R², try with more relaxed requirements
+        if best_fit is None and min_r2 > 0.95:
+            return self.find_highest_linear_region(vga, sqrt_id, min_r2=0.95)
+        elif best_fit is None and min_r2 > 0.90:
+            return self.find_highest_linear_region(vga, sqrt_id, min_r2=0.90)
+        elif best_fit is None and min_r2 > 0.85:
+            return self.find_highest_linear_region(vga, sqrt_id, min_r2=0.85)
+            
+        return best_fit
+    
+    def extract_vth_highest_linearity(self, vga, id_current, pH, temperature, plot=False):
+        """
+        Extract Vth from sqrt(Id) vs Vga using HIGHEST linear region - Optimized
+        """
+        print(f"      Processing {temperature}K...", end=' ')
+        
+        # Convert to numpy and clean data
+        if hasattr(vga, 'values'):
+            vga = vga.values
+        if hasattr(id_current, 'values'):
+            id_current = id_current.values
+        
+        # Remove invalid data
+        valid_mask = (id_current > 0) & np.isfinite(id_current) & np.isfinite(vga)
+        if valid_mask.sum() < 6:
+            print("Insufficient data")
+            return np.nan, np.nan
+        
+        vga_clean = vga[valid_mask]
+        id_clean = id_current[valid_mask]
+        
+        # Sort by Vga
+        sort_idx = np.argsort(vga_clean)
+        vga_sorted = vga_clean[sort_idx]
+        id_sorted = id_clean[sort_idx]
+        
+        # Special handling for pH 3 - very small currents
+        if pH == 3:
+            # For pH 3, use a more aggressive threshold to get into measurable current region
+            # Find the point where current becomes consistently measurable
+            id_median = np.median(id_sorted)
+            if id_median < 1e-12:  # Very small currents
+                # Use top 70% of current range
+                id_threshold = np.percentile(id_sorted, 30)
+            else:
+                id_threshold = 0.01 * id_sorted.max()
+        else:
+            # For other pH values, use standard approach
+            id_threshold = 0.05 * id_sorted.max()
+        
+        # Calculate sqrt(Id) - handle very small numbers carefully
+        sqrt_id = np.sqrt(np.abs(id_sorted))
+        
+        # Focus on region above threshold
+        saturation_mask = id_sorted >= id_threshold
+        
+        if saturation_mask.sum() < 6:
+            # More aggressive fallback for pH 3
+            if pH == 3:
+                # Use top 50% of data points by current
+                n_points = len(id_sorted)
+                top_50_percent = int(0.5 * n_points)
+                if top_50_percent >= 6:
+                    saturation_mask = np.zeros_like(id_sorted, dtype=bool)
+                    # Get indices of top 50% currents
+                    top_indices = np.argsort(id_sorted)[-top_50_percent:]
+                    saturation_mask[top_indices] = True
+                else:
+                    print("Insufficient data even with aggressive thresholding")
+                    return np.nan, np.nan
+            else:
+                # Standard fallback
+                id_threshold = 0.02 * id_sorted.max()
+                saturation_mask = id_sorted >= id_threshold
+        
+        if saturation_mask.sum() < 6:
+            print("Insufficient saturation data")
+            return np.nan, np.nan
+        
+        vga_sat = vga_sorted[saturation_mask]
+        sqrt_id_sat = sqrt_id[saturation_mask]
+        
+        # For pH 3, try more relaxed criteria from the start
+        if pH == 3:
+            best_fit = self.find_highest_linear_region(vga_sat, sqrt_id_sat, min_r2=0.90)
+        else:
+            best_fit = self.find_highest_linear_region(vga_sat, sqrt_id_sat)
+        
+        if best_fit is not None:
+            print(f"Vth={best_fit['vth']:.3f}V (R²={best_fit['r2']:.3f})")
+            
+            if plot:
+                self.plot_vth_extraction_detailed(vga_sorted, sqrt_id, vga_sat, sqrt_id_sat, 
+                                                best_fit, pH, temperature)
+            
+            return best_fit['vth'], best_fit['r2']
+        else:
+            print("No valid linear region found")
+            return np.nan, np.nan
+    
+    def plot_vth_extraction_detailed(self, vga_full, sqrt_id_full, vga_sat, sqrt_id_sat, 
+                                   fit_result, pH, temperature):
+        """Detailed plot of Vth extraction process"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot 1: Full sqrt(Id) vs Vga
+        ax1.plot(vga_full, sqrt_id_full * 1e3, 'b.-', alpha=0.7, label='All data')
+        ax1.plot(vga_sat, sqrt_id_sat * 1e3, 'ro-', markersize=4, label='Saturation region')
+        
+        # Highlight best fit region
+        start_idx = fit_result['start_idx']
+        end_idx = fit_result['end_idx']
+        vga_fit = vga_sat[start_idx:end_idx]
+        sqrt_id_fit = sqrt_id_sat[start_idx:end_idx]
+        
+        ax1.plot(vga_fit, sqrt_id_fit * 1e3, 'g-', linewidth=4, label=f'Best fit region (R²={fit_result["r2"]:.4f})')
+        
+        # Plot extrapolation
+        vth = fit_result['vth']
+        vga_extrap = np.array([vth, vga_fit.max()])
+        sqrt_id_extrap = fit_result['slope'] * vga_extrap + fit_result['intercept']
+        ax1.plot(vga_extrap, sqrt_id_extrap * 1e3, 'r--', linewidth=3, label='Extrapolation')
+        ax1.plot(vth, 0, 'ko', markersize=10, label=f'Vth = {vth:.3f}V')
+        
+        ax1.set_xlabel('Gate Voltage (V)')
+        ax1.set_ylabel('√Id (mA^0.5)')
+        ax1.set_title(f'sqrt(Id) vs Vga - pH {pH}, {temperature}K')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Zoom on fit region
+        ax2.plot(vga_fit, sqrt_id_fit * 1e3, 'go', markersize=8, label='Fit data')
+        sqrt_id_fitted = fit_result['slope'] * vga_fit + fit_result['intercept']
+        ax2.plot(vga_fit, sqrt_id_fitted * 1e3, 'r-', linewidth=2, label='Linear fit')
+        ax2.set_xlabel('Gate Voltage (V)')
+        ax2.set_ylabel('√Id (mA^0.5)')
+        ax2.set_title(f'Best Linear Region\nR² = {fit_result["r2"]:.6f}, Span = {fit_result["voltage_span"]:.2f}V')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: Original Id vs Vga (log scale)
+        id_full = sqrt_id_full**2
+        ax3.semilogy(vga_full, id_full * 1e6, 'b.-', alpha=0.7)
+        ax3.set_xlabel('Gate Voltage (V)')
+        ax3.set_ylabel('Id (µA)')
+        ax3.set_title('Original I-V Curve (Log scale)')
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot 4: Fit quality metrics
+        residuals = sqrt_id_fit - sqrt_id_fitted
+        ax4.plot(vga_fit, residuals * 1e3, 'ro-')
+        ax4.axhline(y=0, color='k', linestyle='--', alpha=0.5)
+        ax4.set_xlabel('Gate Voltage (V)')
+        ax4.set_ylabel('Residuals (mA^0.5)')
+        ax4.set_title(f'Fit Residuals\nStd = {np.std(residuals)*1e3:.3f} mA^0.5')
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print detailed fit statistics
+        print(f"\n=== DETAILED FIT ANALYSIS: pH {pH}, {temperature}K ===")
+        print(f"Extracted Vth: {vth:.4f} V")
+        print(f"R²: {fit_result['r2']:.6f}")
+        print(f"P-value: {fit_result['p_value']:.2e}")
+        print(f"Slope: {fit_result['slope']:.2e}")
+        print(f"Voltage span: {fit_result['voltage_span']:.3f} V")
+        print(f"Number of points: {fit_result['n_points']}")
+        print(f"Voltage range: {fit_result['vga_range'][0]:.2f}V to {fit_result['vga_range'][1]:.2f}V")
+    
+    def calculate_transconductance(self, vga, id_current):
+        """Calculate transconductance"""
+        if hasattr(vga, 'values'):
+            vga = vga.values
+        if hasattr(id_current, 'values'):
+            id_current = id_current.values
+            
+        if len(vga) < 3:
+            return np.nan, np.nan
+            
+        gm = np.gradient(id_current, vga)
+        max_idx = np.argmax(gm)
+        return gm[max_idx], vga[max_idx]
+    
+    def calculate_subthreshold_swing(self, vga, id_current, vth):
+        """Calculate subthreshold swing"""
+        if hasattr(vga, 'values'):
+            vga = vga.values
+        if hasattr(id_current, 'values'):
+            id_current = id_current.values
+            
+        if not np.isfinite(vth):
+            return np.nan
+            
+        # Find subthreshold region
+        sub_mask = vga < (vth - 0.15)  # 150mV before Vth
+        
+        if sub_mask.sum() < 5:
+            return np.nan
+            
+        vga_sub = vga[sub_mask]
+        id_sub = id_current[sub_mask]
+        
+        # Remove very small currents
+        valid_mask = id_sub > 1e-14
+        if valid_mask.sum() < 5:
+            return np.nan
+            
+        vga_sub = vga_sub[valid_mask]
+        log_id = np.log10(id_sub[valid_mask])
+        
+        try:
+            slope, _, r_value, _, _ = stats.linregress(vga_sub, log_id)
+            if r_value**2 > 0.9 and slope > 0:
+                return 1000 / slope  # mV/decade
+        except:
+            pass
+            
+        return np.nan
+    
+    def find_max_transconductance_vga_pH7(self, temperature):
+        """
+        Find the Vga where transconductance is maximum at pH 7 for given temperature
+        """
+        temp_idx = None
+        for i, temp in enumerate(self.temperatures):
+            if temp == temperature:
+                temp_idx = i
+                break
+        
+        if temp_idx is None:
+            return np.nan
+        
+        temp_col = self.temp_cols[temp_idx]
+        
+        # Get pH 7 data
+        if 7 not in self.pH_data:
+            print(f"    Error: pH 7 data not found")
+            return np.nan
+        
+        pH7_df = self.pH_data[7]
+        
+        if temp_col not in pH7_df.columns:
+            print(f"    Error: Column {temp_col} not found for pH 7")
+            return np.nan
+        
+        # Extract data
+        vga = pH7_df[self.vga_col].values
+        id_current = pH7_df[temp_col].values
+        
+        # Clean data
+        valid_mask = np.isfinite(vga) & np.isfinite(id_current) & (id_current > 0)
+        if valid_mask.sum() < 10:
+            print(f"    Error: Insufficient valid data for pH 7 at {temperature}K")
+            return np.nan
+        
+        vga_clean = vga[valid_mask]
+        id_clean = id_current[valid_mask]
+        
+        # Sort by Vga
+        sort_idx = np.argsort(vga_clean)
+        vga_sorted = vga_clean[sort_idx]
+        id_sorted = id_clean[sort_idx]
+        
+        # Calculate transconductance (dId/dVga)
+        gm = np.gradient(id_sorted, vga_sorted)
+        
+        # Find maximum transconductance
+        max_gm_idx = np.argmax(gm)
+        vga_at_max_gm = vga_sorted[max_gm_idx]
+        max_gm_value = gm[max_gm_idx]
+        
+        print(f"    pH 7, {temperature}K: Max gm = {max_gm_value*1e6:.2f} µS at Vga = {vga_at_max_gm:.3f}V")
+        
+        return vga_at_max_gm
+
+    def calculate_current_sensitivity_at_max_gm(self, temperature):
+        """
+        Calculate current sensitivity using Vga at maximum transconductance for pH 7
+        """
+        # Step 1: Find Vga at maximum transconductance for pH 7
+        optimal_vga = self.find_max_transconductance_vga_pH7(temperature)
+        
+        if not np.isfinite(optimal_vga):
+            print(f"    {temperature}K: Failed to find max gm Vga")
+            return np.nan, np.nan
+        
+        temp_idx = None
+        for i, temp in enumerate(self.temperatures):
+            if temp == temperature:
+                temp_idx = i
+                break
+        
+        temp_col = self.temp_cols[temp_idx]
+        
+        # Step 2: Extract current at this Vga for all pH values
+        pH_values = []
+        current_values = []
+        
+        print(f"    Extracting Id vs pH data at Vga = {optimal_vga:.3f}V for {temperature}K:")
+        
+        for pH in sorted(self.pH_data.keys()):
+            pH_df = self.pH_data[pH]
+            
+            if temp_col not in pH_df.columns:
+                print(f"      pH {pH}: Column {temp_col} not found")
+                continue
+            
+            vga = pH_df[self.vga_col].values
+            id_current = pH_df[temp_col].values
+            
+            # Clean data
+            valid_mask = np.isfinite(vga) & np.isfinite(id_current) & (id_current > 0)
+            if valid_mask.sum() < 3:
+                print(f"      pH {pH}: Insufficient valid data")
+                continue
+            
+            vga_clean = vga[valid_mask]
+            id_clean = id_current[valid_mask]
+            
+            # Check if optimal Vga is within range
+            if optimal_vga >= vga_clean.min() and optimal_vga <= vga_clean.max():
+                # Interpolate to find current at optimal Vga
+                id_at_optimal = np.interp(optimal_vga, vga_clean, id_clean)
+                pH_values.append(pH)
+                current_values.append(id_at_optimal)
+                print(f"      pH {pH}: Id = {id_at_optimal:.3e} A")
+            else:
+                # Find closest Vga if within tolerance
+                vga_diff = np.abs(vga_clean - optimal_vga)
+                closest_idx = np.argmin(vga_diff)
+                
+                if vga_diff[closest_idx] < 0.2:  # 200mV tolerance
+                    actual_vga = vga_clean[closest_idx]
+                    id_at_closest = id_clean[closest_idx]
+                    pH_values.append(pH)
+                    current_values.append(id_at_closest)
+                    print(f"      pH {pH}: Id = {id_at_closest:.3e} A at Vga = {actual_vga:.3f}V (diff: {vga_diff[closest_idx]:.3f}V)")
+                else:
+                    print(f"      pH {pH}: Vga {optimal_vga:.3f}V not available (range: {vga_clean.min():.3f}V to {vga_clean.max():.3f}V)")
+        
+        # Step 3: Calculate current sensitivity (dId/dpH)
+        if len(pH_values) >= 3:
+            try:
+                slope, intercept, r_value, p_value, std_err = stats.linregress(pH_values, current_values)
+                r2 = r_value**2
+                
+                print(f"    Linear regression: Slope = {slope:.3e} A/pH, R² = {r2:.4f}, P-value = {p_value:.2e}")
+                
+                if r2 > 0.7:  # Good linearity requirement
+                    print(f"    ✅ Current sensitivity: {slope*1e6:.2f} µA/pH (R² = {r2:.4f})")
+                    return slope, optimal_vga
+                else:
+                    print(f"    ❌ Poor linearity (R² = {r2:.4f})")
+                    return np.nan, optimal_vga
+                    
+            except Exception as e:
+                print(f"    ❌ Linear regression failed: {e}")
+                return np.nan, optimal_vga
+        else:
+            print(f"    ❌ Insufficient pH points for regression (got {len(pH_values)}, need ≥3)")
+            return np.nan, optimal_vga
+
+    def get_id_vs_ph_data_for_analysis(self):
+        """
+        Extract Id vs pH data at max transconductance Vga for each temperature
+        Returns organized data for further analysis
+        """
+        analysis_data = {}
+        
+        print("\n" + "="*60)
+        print("EXTRACTING Id vs pH DATA AT MAX TRANSCONDUCTANCE Vga")
+        print("="*60)
+        
+        for temp in self.temperatures:
+            print(f"\n📊 Temperature: {temp}K")
+            
+            # Find optimal Vga (max gm at pH 7)
+            optimal_vga = self.find_max_transconductance_vga_pH7(temp)
+            
+            if not np.isfinite(optimal_vga):
+                print(f"    ❌ Failed to find optimal Vga")
+                continue
+            
+            temp_idx = None
+            for i, t in enumerate(self.temperatures):
+                if t == temp:
+                    temp_idx = i
+                    break
+            
+            temp_col = self.temp_cols[temp_idx]
+            
+            # Extract Id vs pH data at this Vga
+            pH_list = []
+            id_list = []
+            vga_actual_list = []
+            
+            for pH in sorted(self.pH_data.keys()):
+                pH_df = self.pH_data[pH]
+                
+                if temp_col not in pH_df.columns:
+                    continue
+                
+                vga = pH_df[self.vga_col].values
+                id_current = pH_df[temp_col].values
+                
+                # Clean data
+                valid_mask = np.isfinite(vga) & np.isfinite(id_current) & (id_current > 0)
+                if valid_mask.sum() < 3:
+                    continue
+                
+                vga_clean = vga[valid_mask]
+                id_clean = id_current[valid_mask]
+                
+                # Get current at optimal Vga
+                if optimal_vga >= vga_clean.min() and optimal_vga <= vga_clean.max():
+                    id_at_optimal = np.interp(optimal_vga, vga_clean, id_clean)
+                    pH_list.append(pH)
+                    id_list.append(id_at_optimal)
+                    vga_actual_list.append(optimal_vga)
+                else:
+                    # Use closest available
+                    vga_diff = np.abs(vga_clean - optimal_vga)
+                    closest_idx = np.argmin(vga_diff)
+                    if vga_diff[closest_idx] < 0.2:
+                        pH_list.append(pH)
+                        id_list.append(id_clean[closest_idx])
+                        vga_actual_list.append(vga_clean[closest_idx])
+            
+            if len(pH_list) >= 3:
+                analysis_data[temp] = {
+                    'pH': pH_list,
+                    'Id': id_list,
+                    'Vga_target': optimal_vga,
+                    'Vga_actual': vga_actual_list
+                }
+                
+                # Print the data
+                print(f"    Target Vga: {optimal_vga:.3f}V")
+                print(f"    pH\tId (µA)\t\tVga_actual (V)")
+                print(f"    {'-'*35}")
+                for i, (pH, id_val, vga_act) in enumerate(zip(pH_list, id_list, vga_actual_list)):
+                    print(f"    {pH}\t{id_val*1e6:.3f}\t\t{vga_act:.3f}")
+                
+                # Calculate sensitivity
+                try:
+                    slope, intercept, r_value, p_value, std_err = stats.linregress(pH_list, id_list)
+                    r2 = r_value**2
+                    print(f"    \n    Current Sensitivity: {slope*1e6:.2f} µA/pH")
+                    print(f"    R²: {r2:.4f}")
+                    print(f"    P-value: {p_value:.2e}")
+                    
+                    analysis_data[temp]['sensitivity'] = slope
+                    analysis_data[temp]['r2'] = r2
+                    analysis_data[temp]['p_value'] = p_value
+                    
+                except Exception as e:
+                    print(f"    ❌ Regression failed: {e}")
+            else:
+                print(f"    ❌ Insufficient data points: {len(pH_list)}")
+        
+        return analysis_data
+    
+    def run_complete_analysis(self):
+        """Run complete Priority 1 analysis - Focus on Vth, gm, and Current Sensitivity"""
+        print("\n" + "="*60)
+        print("PRIORITY 1 ANALYSIS: Vth + Transconductance + Current Sensitivity")
+        print("="*60)
+        
+        # Quick data inspection
+        print("\nData Quality Check:")
+        for pH in sorted(self.pH_data.keys()):
+            pH_df = self.pH_data[pH]
+            sample_current = pH_df[self.temp_cols[0]].values  # 293K data
+            print(f"pH {pH}: Current range {sample_current.min():.2e} to {sample_current.max():.2e} A")
+        
+        results = []
+        total_analyses = len(self.pH_data.keys()) * len(self.temperatures)
+        completed = 0
+        
+        # Analyze all pH-temperature combinations
+        for pH in sorted(self.pH_data.keys()):
+            print(f"\n📊 Analyzing pH {pH}...")
+            
+            for temp_idx, temp in enumerate(self.temperatures):
+                completed += 1
+                print(f"  Progress: {completed}/{total_analyses}")
+                
+                temp_col = self.temp_cols[temp_idx]
+                pH_df = self.pH_data[pH]
+                
+                if temp_col not in pH_df.columns:
+                    continue
+                
+                # Extract data
+                vga = pH_df[self.vga_col].values
+                id_current = pH_df[temp_col].values
+                
+                # Remove invalid data
+                valid_mask = np.isfinite(vga) & np.isfinite(id_current) & (id_current > 0)
+                if valid_mask.sum() < 6:
+                    print(f"      {temp}K: Insufficient valid data")
+                    continue
+                
+                vga = vga[valid_mask]
+                id_current = id_current[valid_mask]
+                
+                # Extract parameters
+                plot_debug = (pH == 7 and temp == 297)  # Plot one example
+                vth, vth_r2 = self.extract_vth_highest_linearity(vga, id_current, pH, temp, plot=plot_debug)
+                gm_max, vga_at_gm_max = self.calculate_transconductance(vga, id_current)
+                ss = self.calculate_subthreshold_swing(vga, id_current, vth)
+                
+                results.append({
+                    'pH': pH,
+                    'temperature': temp,
+                    'vth': vth,
+                    'vth_r2': vth_r2,
+                    'gm_max': gm_max,
+                    'vga_at_gm_max': vga_at_gm_max,
+                    'subthreshold_swing': ss
+                })
+        
+        # Convert to DataFrame
+        self.results_df = pd.DataFrame(results)
+        
+        if len(self.results_df) == 0:
+            print("❌ No valid results obtained!")
+            return None
+        
+        # Show extraction success rate
+        successful_vth = (~self.results_df['vth'].isna()).sum()
+        total_attempts = len(self.results_df)
+        success_rate = successful_vth / total_attempts * 100
+        print(f"\n✅ Vth Extraction Success Rate: {successful_vth}/{total_attempts} ({success_rate:.1f}%)")
+        
+        # Calculate current sensitivity for each temperature using max gm method
+        print("\n🔬 Calculating current sensitivity using max transconductance Vga at pH 7...")
+        current_sensitivity_results = []
+        
+        for temp in self.temperatures:
+            print(f"\n  📊 Temperature {temp}K:")
+            current_sens, optimal_vga = self.calculate_current_sensitivity_at_max_gm(temp)
+            
+            current_sensitivity_results.append({
+                'temperature': temp,
+                'current_sensitivity': current_sens,
+                'optimal_vga': optimal_vga
+            })
+        
+        self.current_sensitivity_df = pd.DataFrame(current_sensitivity_results)
+        
+        # Extract detailed Id vs pH data for analysis
+        print("\n🔍 Extracting detailed Id vs pH data at max transconductance Vga:")
+        self.id_ph_analysis_data = self.get_id_vs_ph_data_for_analysis()
+        
+        # Calculate temperature coefficients
+        print("\n🔬 Calculating temperature coefficients...")
+        self.calculate_temperature_coefficients()
+        
+        # Print comprehensive results
+        self.print_comprehensive_results()
+        
+        # Create plots
+        print("\n📈 Creating visualization plots...")
+        self.create_comprehensive_plots()
+        
+        # Save results
+        output_file = 'GaAs_Priority1_Results.csv'
+        self.results_df.to_csv(output_file, index=False)
+        
+        output_file_cs = 'GaAs_Current_Sensitivity_Results.csv'
+        self.current_sensitivity_df.to_csv(output_file_cs, index=False)
+        
+        print(f"\n💾 Results saved to: {output_file}")
+        print(f"💾 Current sensitivity results saved to: {output_file_cs}")
+        
+        return self.results_df
+    
+    def calculate_temperature_coefficients(self):
+        """Calculate temperature coefficients with high precision"""
+        self.tc_results = {}
+        
+        for pH in sorted(self.results_df['pH'].unique()):
+            pH_data = self.results_df[self.results_df['pH'] == pH]
+            
+            pH_tc = {'pH': pH}
+            
+            # Vth temperature coefficient
+            valid_vth = pH_data.dropna(subset=['vth'])
+            if len(valid_vth) >= 4:  # Need at least 4 points for good statistics
+                slope, intercept, r_value, p_value, std_err = stats.linregress(valid_vth['temperature'], valid_vth['vth'])
+                pH_tc['vth_tc'] = slope * 1000  # mV/K
+                pH_tc['vth_r2'] = r_value**2
+                pH_tc['vth_p_value'] = p_value
+            else:
+                pH_tc['vth_tc'] = np.nan
+                pH_tc['vth_r2'] = np.nan
+                pH_tc['vth_p_value'] = np.nan
+            
+            # Transconductance temperature coefficient
+            valid_gm = pH_data.dropna(subset=['gm_max'])
+            if len(valid_gm) >= 4:
+                gm_mean = valid_gm['gm_max'].mean()
+                slope, _, r_value, p_value, _ = stats.linregress(valid_gm['temperature'], valid_gm['gm_max'])
+                pH_tc['gm_tc'] = (slope / gm_mean) * 100  # %/K
+                pH_tc['gm_r2'] = r_value**2
+                pH_tc['gm_p_value'] = p_value
+            else:
+                pH_tc['gm_tc'] = np.nan
+                pH_tc['gm_r2'] = np.nan
+                pH_tc['gm_p_value'] = np.nan
+            
+            # Subthreshold swing temperature coefficient
+            valid_ss = pH_data.dropna(subset=['subthreshold_swing'])
+            if len(valid_ss) >= 4:
+                ss_mean = valid_ss['subthreshold_swing'].mean()
+                slope, _, r_value, p_value, _ = stats.linregress(valid_ss['temperature'], valid_ss['subthreshold_swing'])
+                pH_tc['ss_tc'] = slope  # mV/dec/K
+                pH_tc['ss_r2'] = r_value**2
+                pH_tc['ss_p_value'] = p_value
+            else:
+                pH_tc['ss_tc'] = np.nan
+                pH_tc['ss_r2'] = np.nan
+                pH_tc['ss_p_value'] = np.nan
+            
+            self.tc_results[pH] = pH_tc
+        
+        # Current sensitivity temperature coefficient
+        if hasattr(self, 'current_sensitivity_df'):
+            valid_cs = self.current_sensitivity_df.dropna(subset=['current_sensitivity'])
+            if len(valid_cs) >= 4:
+                cs_mean = valid_cs['current_sensitivity'].mean()
+                slope, _, r_value, p_value, _ = stats.linregress(valid_cs['temperature'], valid_cs['current_sensitivity'])
+                self.current_sensitivity_tc = (slope / cs_mean) * 100  # %/K
+                self.current_sensitivity_r2 = r_value**2
+                self.current_sensitivity_p_value = p_value
+            else:
+                self.current_sensitivity_tc = np.nan
+                self.current_sensitivity_r2 = np.nan
+                self.current_sensitivity_p_value = np.nan
+        else:
+            self.current_sensitivity_tc = np.nan
+            self.current_sensitivity_r2 = np.nan
+            self.current_sensitivity_p_value = np.nan
+    
+    def print_comprehensive_results(self):
+        """Print comprehensive analysis results"""
+        print(f"\n" + "="*80)
+        print("COMPREHENSIVE RESULTS: GaAs ISFET Analysis (Vth + gm + Current Sensitivity)")
+        print("="*80)
+        
+        print("\n1. THRESHOLD VOLTAGE ANALYSIS (High-Linearity Extraction):")
+        print("pH\tVth_293K(V)\tVth_303K(V)\tTC(mV/K)\tR²_temp\tR²_avg_extraction")
+        print("-" * 75)
+        
+        for pH in sorted(self.tc_results.keys()):
+            tc_data = self.tc_results[pH]
+            
+            # Get Vth values at extreme temperatures
+            ph_data = self.results_df[self.results_df['pH'] == pH]
+            vth_293 = ph_data[ph_data['temperature'] == 293]['vth'].iloc[0] if len(ph_data[ph_data['temperature'] == 293]) > 0 else np.nan
+            vth_303 = ph_data[ph_data['temperature'] == 303]['vth'].iloc[0] if len(ph_data[ph_data['temperature'] == 303]) > 0 else np.nan
+            
+            # Average R² for Vth extraction quality
+            avg_r2_extraction = ph_data['vth_r2'].mean() if not ph_data['vth_r2'].isna().all() else np.nan
+            
+            print(f"{pH:.0f}\t{vth_293:.3f}\t\t{vth_303:.3f}\t\t{tc_data['vth_tc']:.2f}\t\t{tc_data['vth_r2']:.3f}\t{avg_r2_extraction:.3f}")
+        
+        print("\n2. TRANSCONDUCTANCE ANALYSIS:")
+        print("pH\tgm_max_293K(µS)\tgm_max_303K(µS)\tTC(%/K)\t\tR²_temp")
+        print("-" * 70)
+        
+        for pH in sorted(self.tc_results.keys()):
+            tc_data = self.tc_results[pH]
+            
+            ph_data = self.results_df[self.results_df['pH'] == pH]
+            gm_293 = ph_data[ph_data['temperature'] == 293]['gm_max'].iloc[0] if len(ph_data[ph_data['temperature'] == 293]) > 0 else np.nan
+            gm_303 = ph_data[ph_data['temperature'] == 303]['gm_max'].iloc[0] if len(ph_data[ph_data['temperature'] == 303]) > 0 else np.nan
+            
+            print(f"{pH:.0f}\t{gm_293*1e6:.2f}\t\t{gm_303*1e6:.2f}\t\t{tc_data['gm_tc']:.3f}\t\t{tc_data['gm_r2']:.3f}")
+        
+        print("\n3. CURRENT SENSITIVITY ANALYSIS:")
+        print("Temperature(K)\tCurrent_Sens(µA/pH)\tOptimal_Vga(V)")
+        print("-" * 50)
+        
+        if hasattr(self, 'current_sensitivity_df'):
+            for _, row in self.current_sensitivity_df.iterrows():
+                if np.isfinite(row['current_sensitivity']):
+                    print(f"{row['temperature']:.0f}\t\t{row['current_sensitivity']*1e6:.2f}\t\t\t{row['optimal_vga']:.2f}")
+                else:
+                    print(f"{row['temperature']:.0f}\t\tFailed\t\t\tN/A")
+            
+            if np.isfinite(self.current_sensitivity_tc):
+                print(f"\nCurrent Sensitivity Temperature Coefficient: {self.current_sensitivity_tc:.3f} %/K (R² = {self.current_sensitivity_r2:.3f})")
+            else:
+                print(f"\nCurrent Sensitivity Temperature Coefficient: Could not calculate")
+        
+        print("\n4. OVERALL TEMPERATURE COEFFICIENTS SUMMARY:")
+        print("Parameter\t\t\tMean TC\t\tRange\t\t\tStd Dev\t\tAvg R²")
+        print("-" * 85)
+        
+        # Calculate statistics
+        vth_tcs = [tc['vth_tc'] for tc in self.tc_results.values() if np.isfinite(tc['vth_tc'])]
+        gm_tcs = [tc['gm_tc'] for tc in self.tc_results.values() if np.isfinite(tc['gm_tc'])]
+        
+        vth_r2s = [tc['vth_r2'] for tc in self.tc_results.values() if np.isfinite(tc['vth_r2'])]
+        gm_r2s = [tc['gm_r2'] for tc in self.tc_results.values() if np.isfinite(tc['gm_r2'])]
+        
+        if vth_tcs:
+            print(f"Vth (mV/K)\t\t\t{np.mean(vth_tcs):.2f}\t\t{np.min(vth_tcs):.2f} to {np.max(vth_tcs):.2f}\t\t{np.std(vth_tcs):.2f}\t\t{np.mean(vth_r2s):.3f}")
+        
+        if gm_tcs:
+            print(f"gm_max (%/K)\t\t\t{np.mean(gm_tcs):.3f}\t\t{np.min(gm_tcs):.3f} to {np.max(gm_tcs):.3f}\t{np.std(gm_tcs):.3f}\t\t{np.mean(gm_r2s):.3f}")
+        
+        if np.isfinite(self.current_sensitivity_tc):
+            print(f"Current Sens (%/K)\t\t{self.current_sensitivity_tc:.3f}\t\tN/A\t\t\tN/A\t\t{self.current_sensitivity_r2:.3f}")
+        
+        print(f"\n5. EXTRACTION QUALITY SUMMARY:")
+        print(f"Average R² for Vth extraction: {self.results_df['vth_r2'].mean():.4f}")
+        print(f"Minimum R² for Vth extraction: {self.results_df['vth_r2'].min():.4f}")
+        print(f"Successful Vth extractions: {(~self.results_df['vth'].isna()).sum()}/{len(self.results_df)}")
+        
+        if hasattr(self, 'current_sensitivity_df'):
+            successful_cs = (~self.current_sensitivity_df['current_sensitivity'].isna()).sum()
+            total_cs = len(self.current_sensitivity_df)
+            print(f"Successful current sensitivity calculations: {successful_cs}/{total_cs}")
+            
+            if successful_cs > 0:
+                cs_data = self.current_sensitivity_df.dropna(subset=['current_sensitivity'])
+                print(f"Current sensitivity range: {cs_data['current_sensitivity'].min()*1e6:.2f} to {cs_data['current_sensitivity'].max()*1e6:.2f} µA/pH")
+    
+    def create_comprehensive_plots(self):
+        """Create comprehensive visualization"""
+        fig = plt.figure(figsize=(20, 12))
+        
+        # Plot 1: Vth vs Temperature
+        plt.subplot(2, 4, 1)
+        for pH in sorted(self.results_df['pH'].unique()):
+            ph_data = self.results_df[self.results_df['pH'] == pH]
+            valid_data = ph_data.dropna(subset=['vth'])
+            if len(valid_data) >= 2:
+                plt.plot(valid_data['temperature'], valid_data['vth'], 'o-', 
+                        label=f'pH {pH:.0f}', linewidth=2, markersize=8)
+        
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('Threshold Voltage (V)')
+        plt.title('Vth vs Temperature\n(High-Linearity Extraction)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 2: Transconductance vs Temperature
+        plt.subplot(2, 4, 2)
+        for pH in sorted(self.results_df['pH'].unique()):
+            ph_data = self.results_df[self.results_df['pH'] == pH]
+            valid_data = ph_data.dropna(subset=['gm_max'])
+            if len(valid_data) >= 2:
+                plt.plot(valid_data['temperature'], valid_data['gm_max']*1e6, 'o-', 
+                        label=f'pH {pH:.0f}', linewidth=2, markersize=8)
+        
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('Max Transconductance (µS)')
+        plt.title('gm_max vs Temperature')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 3: Subthreshold Swing vs Temperature
+        plt.subplot(2, 4, 3)
+        for pH in sorted(self.results_df['pH'].unique()):
+            ph_data = self.results_df[self.results_df['pH'] == pH]
+            valid_data = ph_data.dropna(subset=['subthreshold_swing'])
+            if len(valid_data) >= 2:
+                plt.plot(valid_data['temperature'], valid_data['subthreshold_swing'], 'o-', 
+                        label=f'pH {pH:.0f}', linewidth=2, markersize=8)
+        
+        plt.xlabel('Temperature (K)')
+        plt.ylabel('Subthreshold Swing (mV/dec)')
+        plt.title('SS vs Temperature')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Plot 4: R² Quality for Vth extraction
+        plt.subplot(2, 4, 4)
+        pH_list = sorted(self.results_df['pH'].unique())
+        avg_r2_by_pH = [self.results_df[self.results_df['pH'] == pH]['vth_r2'].mean() for pH in pH_list]
+        
+        bars = plt.bar(range(len(pH_list)), avg_r2_by_pH, alpha=0.7, 
+                      color=['red' if r2 < 0.99 else 'green' for r2 in avg_r2_by_pH])
+        plt.xlabel('pH')
+        plt.ylabel('Average R² for Vth Extraction')
+        plt.title('Extraction Quality by pH')
+        plt.xticks(range(len(pH_list)), [f'{pH:.0f}' for pH in pH_list])
+        plt.ylim(0.95, 1.0)
+        plt.grid(True, alpha=0.3)
+        
+        # Add R² value labels on bars
+        for i, (bar, r2) in enumerate(zip(bars, avg_r2_by_pH)):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001, 
+                    f'{r2:.3f}', ha='center', va='bottom', fontsize=10)
+        
+        # Plot 5-8: Temperature Coefficients
+        tc_params = ['vth_tc', 'gm_tc', 'ss_tc']
+        tc_labels = ['Vth TC (mV/K)', 'gm TC (%/K)', 'SS TC (mV/dec/K)']
+        
+        for i, (param, label) in enumerate(zip(tc_params, tc_labels)):
+            plt.subplot(2, 4, 5 + i)
+            
+            pH_vals = []
+            tc_vals = []
+            r2_vals = []
+            
+            for pH in sorted(self.tc_results.keys()):
+                if np.isfinite(self.tc_results[pH][param]):
+                    pH_vals.append(pH)
+                    tc_vals.append(self.tc_results[pH][param])
+                    r2_vals.append(self.tc_results[pH][param.replace('_tc', '_r2')])
+            
+            if tc_vals:
+                colors = ['red' if r2 < 0.9 else 'orange' if r2 < 0.95 else 'green' for r2 in r2_vals]
+                bars = plt.bar(range(len(pH_vals)), tc_vals, alpha=0.7, color=colors)
+                plt.xlabel('pH')
+                plt.ylabel(label)
+                plt.title(f'{label} by pH')
+                plt.xticks(range(len(pH_vals)), [f'{pH:.0f}' for pH in pH_vals])
+                plt.grid(True, alpha=0.3)
+                
+                # Add value labels
+                for bar, val, r2 in zip(bars, tc_vals, r2_vals):
+                    plt.text(bar.get_x() + bar.get_width()/2, 
+                            bar.get_height() + 0.01*abs(bar.get_height()), 
+                            f'{val:.2f}\n(R²={r2:.2f})', ha='center', va='bottom', fontsize=8)
+        
+        plt.tight_layout()
+        plt.suptitle('GaAs ISFET Priority 1 Analysis - Max Transconductance Method', 
+                    fontsize=16, y=1.02)
+        plt.show()
+
+# Main execution
+def main():
+    """Main function"""
+    filename = '/kaggle/input/si-all-temp/Si_Al2O3_Id_vs_Vg_all_temp.xlsx'
+    
+    print("="*60)
+    print("GaAs ISFET PRIORITY 1 ANALYSIS")
+    print("FOCUS: MAX TRANSCONDUCTANCE METHOD")
+    print("="*60)
+    
+    try:
+        analyzer = ISFETAnalyzer(filename)
+        data = analyzer.load_data()
+        
+        if data is not None:
+            results = analyzer.run_complete_analysis()
+            
+            if results is not None:
+                print(f"\n✅ Analysis completed successfully!")
+                print(f"📊 Total measurements: {len(results)}")
+                print(f"💾 Results saved to CSV file")
+                return analyzer, results
+            else:
+                print("❌ Analysis failed")
+                return None, None
+        else:
+            print("❌ Data loading failed")
+            return None, None
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+# Run the analysis
+if __name__ == "__main__":
+    analyzer, results = main()
